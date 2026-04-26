@@ -21,21 +21,32 @@ query phrasings never seen during training (novel paraphrased templates,
 
 ## Motivation
 
-Autonomous research agents increasingly use external tools (databases,
-APIs, calculators) to ground their responses in real data. When a tool
-returns an empty result, instruction-tuned models face a tension between
-helpfulness and honesty. In practice, they frequently resolve this tension
-by fabricating plausible-sounding numerical values. These fabrications
-are particularly dangerous because they carry the implicit authority of
-tool-grounded answers: downstream consumers (other agents, automated
-pipelines, human researchers) have no signal that the number was invented
-rather than retrieved.
+Autonomous AI agents hold immense potential to accelerate scientific
+research. An agent that can query databases, run simulations, and
+synthesize findings across thousands of papers could compress months of
+literature review into hours. But today, these agents have a critical
+failure mode: when a tool returns no data, they quietly fabricate
+plausible-looking numbers instead of saying "I don't know." A materials
+science agent asked for the band gap of an unstudied compound will
+confidently report "approximately 2.3 eV" with no indication that this
+number was invented. These fabrications propagate downstream into
+experimental designs, simulation parameters, and published results,
+contaminating the very research the agent was meant to accelerate.
 
-Existing hallucination detection methods underperform in this setting
-because their training distributions do not include the specific structure
-of tool-call exchanges with explicit empty results. A probe trained on
-the precise distribution of interest, post-tool-call and pre-generation,
-should outperform generic approaches.
+This is not a generic hallucination problem. The fabricated numbers
+appear inside tool-grounded workflows, so they carry the implicit
+authority of database lookups. Existing hallucination detectors, trained
+on general question-answering distributions, miss these cases because
+they have never seen the specific structure of a tool-call exchange
+where the tool explicitly returned nothing.
+
+This project uses mechanistic interpretability to attack the problem at
+its source. Rather than checking the model's output after the fact, we
+read the model's internal state at the moment just before it starts
+generating, and predict whether it is about to fabricate. If the detector
+fires, we intervene before the fabrication ever reaches the user. The
+goal is to make autonomous research agents trustworthy enough to actually
+use.
 
 ## Results
 
