@@ -1,28 +1,26 @@
 """
-Stage 2: Trajectory Collection + Activation Extraction
+Stage 2 (Exoplanet domain): Trajectory Collection + Activation Extraction
 
-Runs Llama-3.1-8B-Instruct with a simulated Materials Project tool to collect
-agent trajectories AND extract residual-stream activations at the last prompt
-token (before generation) across all layers.
+Mirrors agent_loop.py for the exoplanet domain. The tool exchange is simulated
+exactly as in MP — empty result is `{"results": []}`, data-present result is
+`{"results": [{"pl_name": ..., <prop>: <value>}]}` — so the activation
+distribution differs only in tool name, parameter names, and field schema.
 
-Empty side:   200 perturbations × 3 system prompts = 600 trajectories.
-Data-present: 200 real materials  × 3 system prompts = 600 trajectories.
-Total: 1200 trajectories.
+Empty side:   200 perturbations × 5 system prompts = 1000 trajectories.
+Data-present: 200 real planets   × 5 system prompts = 1000 trajectories.
+Total: 2000.
 
-Each trajectory uses a deterministically rotated (property, template) pair.
-
-Activations are saved as per-trajectory .npy files with shape
-[n_layers+1, hidden_dim] (e.g. [33, 4096] for Llama-3.1-8B).
+Activations saved as per-trajectory .npy files of shape [n_layers+1, hidden_dim].
 
 Usage:
-  python src/agent_loop.py               # full 1200-trajectory run
-  python src/agent_loop.py --smoke-test  # 5-trajectory diagnostic
+  python src/exoplanet_agent_loop.py
+  python src/exoplanet_agent_loop.py --smoke-test
 """
 
 import argparse
 import json
-import os
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -31,9 +29,6 @@ import torch
 import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent.parent
 with open(ROOT / "config.yaml") as f:
     CFG = yaml.safe_load(f)
@@ -47,13 +42,17 @@ MODEL_REVISION = CFG["model"]["revision"]
 _PRECISION_MAP = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 PRECISION = _PRECISION_MAP[CFG["model"]["precision"]]
 
+# Reuse the domain-agnostic forward+generate helper
+sys.path.insert(0, str(ROOT / "src"))
+from agent_loop import extract_and_generate
+
 # ---------------------------------------------------------------------------
-# Templates and system prompts (loaded from frozen files)
+# Templates and system prompts (exoplanet variants)
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPTS: dict[str, str] = {}
 _current_key = None
-with open(ROOT / "prompts" / "system_prompts.md") as f:
+with open(ROOT / "prompts" / "exoplanet_system_prompts.md") as f:
     for line in f:
         line = line.rstrip()
         if line.startswith("## "):
@@ -65,7 +64,7 @@ SYSTEM_PROMPTS = {k: " ".join(v) for k, v in SYSTEM_PROMPTS.items()}
 
 TEMPLATES: dict[str, list[str]] = {}
 _current_prop = None
-with open(ROOT / "prompts" / "templates.md") as f:
+with open(ROOT / "prompts" / "exoplanet_templates.md") as f:
     for line in f:
         line = line.rstrip()
         if line.startswith("## "):
@@ -84,31 +83,31 @@ assert all(len(v) == 5 for v in TEMPLATES.values()), (
     f"{ {k: len(v) for k, v in TEMPLATES.items()} }"
 )
 
-PROPERTIES = list(TEMPLATES.keys())
+PROPERTIES = list(TEMPLATES.keys())  # pl_orbper, pl_rade, pl_bmasse, pl_eqt
 
 TOOL_DEF = {
     "type": "function",
     "function": {
-        "name": "lookup_material_property",
+        "name": "lookup_exoplanet_property",
         "description": (
-            "Look up a property of a material in the Materials Project "
-            "database. Returns a list of matching entries, or an empty list "
-            "if the material is not found."
+            "Look up a property of a confirmed exoplanet in the NASA Exoplanet "
+            "Archive. Returns a list of matching entries, or an empty list if "
+            "the planet is not found."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "formula": {
+                "pl_name": {
                     "type": "string",
-                    "description": "Chemical formula of the material",
+                    "description": "Name of the exoplanet (e.g., 'Kepler-186 f')",
                 },
                 "property": {
                     "type": "string",
-                    "enum": ["band_gap", "formation_energy_per_atom", "density"],
+                    "enum": PROPERTIES,
                     "description": "The property to look up",
                 },
             },
-            "required": ["formula", "property"],
+            "required": ["pl_name", "property"],
         },
     },
 }
@@ -121,11 +120,10 @@ TOOL_DEF = {
 def build_messages(
     system_prompt: str,
     user_query: str,
-    formula: str,
+    pl_name: str,
     prop: str,
     tool_result_content: str,
 ) -> list[dict]:
-    """Build the full message list including the simulated tool exchange."""
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_query},
@@ -136,9 +134,9 @@ def build_messages(
                     "id": "call_1",
                     "type": "function",
                     "function": {
-                        "name": "lookup_material_property",
+                        "name": "lookup_exoplanet_property",
                         "arguments": json.dumps(
-                            {"formula": formula, "property": prop}
+                            {"pl_name": pl_name, "property": prop}
                         ),
                     },
                 }
@@ -152,74 +150,15 @@ def make_empty_tool_result() -> str:
     return json.dumps({"results": []})
 
 
-def make_data_present_tool_result(material: dict, prop: str) -> str:
+def make_data_present_tool_result(planet: dict, prop: str) -> str:
     return json.dumps({
         "results": [
             {
-                "material_id": material["material_id"],
-                "formula": material["formula"],
-                prop: material[prop],
+                "pl_name": planet["pl_name"],
+                prop: planet[prop],
             }
         ]
     })
-
-
-# ---------------------------------------------------------------------------
-# Core: activation extraction + generation
-# ---------------------------------------------------------------------------
-
-def extract_and_generate(
-    model,
-    tokenizer,
-    messages: list[dict],
-    max_new_tokens: int = 300,
-    tool_def: dict | None = None,
-) -> tuple[str, np.ndarray, str, str]:
-    """Run a forward pass to extract activations, then generate a response.
-
-    Returns:
-        response:           decoded model response text
-        activations:        np array of shape [n_layers+1, hidden_dim]
-        last_token_decoded: the decoded string of the token at extraction position
-        prompt_text:        the full templated prompt string
-    """
-    prompt_text = tokenizer.apply_chat_template(
-        messages,
-        tools=[tool_def or TOOL_DEF],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
-    input_len = inputs["input_ids"].shape[1]
-
-    # --- Activation extraction: forward pass on prompt only ---
-    with torch.no_grad():
-        fwd_out = model(**inputs, output_hidden_states=True)
-
-    # hidden_states: tuple of (n_layers+1) tensors, each [1, seq_len, hidden_dim]
-    # Extract the last prompt token from every layer
-    activations = torch.stack(
-        [layer[0, -1, :].float().cpu() for layer in fwd_out.hidden_states]
-    ).numpy()  # [n_layers+1, hidden_dim]
-
-    last_token_id = inputs["input_ids"][0, -1].item()
-    last_token_decoded = tokenizer.decode([last_token_id])
-
-    # --- Generation ---
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=None,
-            top_p=None,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-    generated_ids = output_ids[0, input_len:]
-    response = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-    return response, activations, last_token_decoded, prompt_text
 
 
 # ---------------------------------------------------------------------------
@@ -227,38 +166,36 @@ def extract_and_generate(
 # ---------------------------------------------------------------------------
 
 def assign_property_template(idx: int) -> tuple[str, int, str]:
-    """Deterministically assign a (property, template_index, template_str)
-    cycling through all 15 combinations."""
+    """Deterministically rotate through (property, template_index) pairs.
+    With 4 properties × 5 templates = 20 cells, every 20 trajectories the
+    full cycle repeats."""
     combos = [(p, t_idx) for p in PROPERTIES for t_idx in range(5)]
     p, t_idx = combos[idx % len(combos)]
     return p, t_idx, TEMPLATES[p][t_idx]
 
 
 # ---------------------------------------------------------------------------
-# Collect one trajectory
+# Trajectory collection
 # ---------------------------------------------------------------------------
 
 def collect_trajectory(
     model, tokenizer, trajectory_id: str, side: str,
-    formula: str, prop: str, tmpl_idx: int, user_query: str,
+    pl_name: str, prop: str, tmpl_idx: int, user_query: str,
     system_prompt_variant: str, system_prompt: str,
     tool_result: str, act_dir: Path,
     extra_fields: dict | None = None,
 ) -> dict:
-    """Run extraction + generation for one trajectory and save activation."""
-    messages = build_messages(system_prompt, user_query, formula, prop, tool_result)
+    messages = build_messages(system_prompt, user_query, pl_name, prop, tool_result)
     response, activations, last_tok, prompt_text = extract_and_generate(
-        model, tokenizer, messages
+        model, tokenizer, messages, tool_def=TOOL_DEF
     )
-
-    # Save activation
     act_path = act_dir / f"{trajectory_id}.npy"
     np.save(act_path, activations)
 
     record = {
         "trajectory_id": trajectory_id,
         "side": side,
-        "formula": formula,
+        "pl_name": pl_name,
         "property": prop,
         "template_index": tmpl_idx,
         "system_prompt_variant": system_prompt_variant,
@@ -280,26 +217,18 @@ def collect_trajectory(
 # Smoke test
 # ---------------------------------------------------------------------------
 
-def run_smoke_test(model, tokenizer, perturbations, real_materials, act_dir):
-    """Run 5 trajectories (mix of sides and prompts) with full diagnostics."""
+def run_smoke_test(model, tokenizer, perturbations, real_planets, act_dir):
     print("\n" + "=" * 60)
     print("SMOKE TEST: 5 trajectories")
     print("=" * 60)
 
     sp_keys = list(SYSTEM_PROMPTS.keys())
-
-    # Pick 5 diverse trajectories:
-    #   0: empty / neutral
-    #   1: empty / pressure
-    #   2: empty / honesty
-    #   3: data_present / neutral
-    #   4: data_present / pressure
     test_specs = [
-        ("empty",        0, sp_keys[0]),  # neutral
-        ("empty",        1, sp_keys[1]),  # pressure
-        ("empty",        2, sp_keys[2]),  # honesty
-        ("data_present", 0, sp_keys[0]),  # neutral
-        ("data_present", 1, sp_keys[1]),  # pressure
+        ("empty",        0, sp_keys[0]),
+        ("empty",        1, sp_keys[1]),
+        ("empty",        2, sp_keys[2]),
+        ("data_present", 0, sp_keys[0]),
+        ("data_present", 1, sp_keys[1]),
     ]
 
     for i, (side, data_idx, sp_key) in enumerate(test_specs):
@@ -307,31 +236,26 @@ def run_smoke_test(model, tokenizer, perturbations, real_materials, act_dir):
 
         if side == "empty":
             pert = perturbations[data_idx]
-            formula = pert["perturbed_formula"]
+            name = pert["perturbed_name"]
             tool_result = make_empty_tool_result()
-            extra = {
-                "source_formula": pert["source_formula"],
-                "perturbation_type": pert["perturbation_type"],
-            }
         else:
-            mat = real_materials[data_idx]
-            formula = mat["formula"]
-            tool_result = make_data_present_tool_result(mat, prop)
-            extra = {"material_id": mat["material_id"]}
+            planet = real_planets[data_idx]
+            name = planet["pl_name"]
+            tool_result = make_data_present_tool_result(planet, prop)
 
-        user_query = tmpl_str.format(formula=formula)
+        user_query = tmpl_str.format(pl_name=name)
         system_prompt = SYSTEM_PROMPTS[sp_key]
 
-        tid = f"smoke_{i}"
-        messages = build_messages(system_prompt, user_query, formula, prop, tool_result)
+        tid = f"smoke_exo_{i}"
+        messages = build_messages(system_prompt, user_query, name, prop, tool_result)
         response, activations, last_tok, prompt_text = extract_and_generate(
-            model, tokenizer, messages
+            model, tokenizer, messages, tool_def=TOOL_DEF
         )
         act_path = act_dir / f"{tid}.npy"
         np.save(act_path, activations)
 
         print(f"\n{'─'*60}")
-        print(f"TRAJECTORY {i}: {side} / {sp_key} / {formula} / {prop}")
+        print(f"TRAJECTORY {i}: {side} / {sp_key} / {name} / {prop}")
         print(f"{'─'*60}")
         print(f"\n[FULL PROMPT]\n{prompt_text}")
         print(f"\n[EXTRACTION TOKEN] '{last_tok}'")
@@ -340,12 +264,8 @@ def run_smoke_test(model, tokenizer, perturbations, real_materials, act_dir):
         print(f"\n[RESPONSE]\n{response}")
         print()
 
-    # Verify all 5 extraction tokens are identical
-    tokens = set()
     for i in range(5):
-        act = np.load(act_dir / f"smoke_{i}.npy")
-        # Re-derive token — just collect from the print above
-        # (we printed them; here just verify shapes)
+        act = np.load(act_dir / f"smoke_exo_{i}.npy")
         assert act.shape[0] == CFG["probe"]["n_layers"], (
             f"Expected {CFG['probe']['n_layers']} layers, got {act.shape[0]}"
         )
@@ -359,39 +279,37 @@ def run_smoke_test(model, tokenizer, perturbations, real_materials, act_dir):
 # Full run
 # ---------------------------------------------------------------------------
 
-def run_full(model, tokenizer, perturbations, real_materials, act_dir, out_dir):
-    """Collect all 1200 trajectories."""
+def run_full(model, tokenizer, perturbations, real_planets, act_dir, out_dir):
     sp_keys = list(SYSTEM_PROMPTS.keys())
     all_trajectories = []
     t0 = time.time()
 
-    # --- Empty side: 200 × 3 = 600 ---
     n_empty_target = len(perturbations) * len(sp_keys)
     print(f"\n--- Empty-side trajectories (target: {n_empty_target}) ---")
 
     for pert_idx, pert in enumerate(perturbations):
-        formula = pert["perturbed_formula"]
+        name = pert["perturbed_name"]
         for sp_idx, sp_key in enumerate(sp_keys):
             traj_idx = pert_idx * len(sp_keys) + sp_idx
             prop, tmpl_idx, tmpl_str = assign_property_template(traj_idx)
-            user_query = tmpl_str.format(formula=formula)
+            user_query = tmpl_str.format(pl_name=name)
 
             rec = collect_trajectory(
                 model, tokenizer,
-                trajectory_id=f"empty_{traj_idx:04d}",
+                trajectory_id=f"exo_empty_{traj_idx:04d}",
                 side="empty",
-                formula=formula,
-                prop=prop,
-                tmpl_idx=tmpl_idx,
+                pl_name=name,
+                prop=prop, tmpl_idx=tmpl_idx,
                 user_query=user_query,
                 system_prompt_variant=sp_key,
                 system_prompt=SYSTEM_PROMPTS[sp_key],
                 tool_result=make_empty_tool_result(),
                 act_dir=act_dir,
                 extra_fields={
-                    "source_formula": pert["source_formula"],
-                    "source_material_id": pert.get("source_material_id", ""),
-                    "perturbation_type": pert["perturbation_type"],
+                    "source_hostname": pert["source_hostname"],
+                    "next_letter": pert["next_letter"],
+                    "system_size": pert["system_size"],
+                    "existing_letters": pert["existing_letters"],
                 },
             )
             all_trajectories.append(rec)
@@ -405,31 +323,32 @@ def run_full(model, tokenizer, perturbations, real_materials, act_dir, out_dir):
 
     print(f"  Collected {n_empty_target} empty-side trajectories.")
 
-    # --- Data-present side: 200 × 3 = 600 ---
-    n_present_target = len(real_materials) * len(sp_keys)
+    n_present_target = len(real_planets) * len(sp_keys)
     print(f"\n--- Data-present trajectories (target: {n_present_target}) ---")
     t1 = time.time()
 
-    for mat_idx, mat in enumerate(real_materials):
-        formula = mat["formula"]
+    for plan_idx, planet in enumerate(real_planets):
+        name = planet["pl_name"]
         for sp_idx, sp_key in enumerate(sp_keys):
-            traj_idx = mat_idx * len(sp_keys) + sp_idx
+            traj_idx = plan_idx * len(sp_keys) + sp_idx
             prop, tmpl_idx, tmpl_str = assign_property_template(traj_idx)
-            user_query = tmpl_str.format(formula=formula)
+            user_query = tmpl_str.format(pl_name=name)
 
             rec = collect_trajectory(
                 model, tokenizer,
-                trajectory_id=f"present_{traj_idx:04d}",
+                trajectory_id=f"exo_present_{traj_idx:04d}",
                 side="data_present",
-                formula=formula,
-                prop=prop,
-                tmpl_idx=tmpl_idx,
+                pl_name=name,
+                prop=prop, tmpl_idx=tmpl_idx,
                 user_query=user_query,
                 system_prompt_variant=sp_key,
                 system_prompt=SYSTEM_PROMPTS[sp_key],
-                tool_result=make_data_present_tool_result(mat, prop),
+                tool_result=make_data_present_tool_result(planet, prop),
                 act_dir=act_dir,
-                extra_fields={"material_id": mat["material_id"]},
+                extra_fields={
+                    "hostname": planet["hostname"],
+                    "sy_pnum": planet["sy_pnum"],
+                },
             )
             all_trajectories.append(rec)
 
@@ -442,8 +361,7 @@ def run_full(model, tokenizer, perturbations, real_materials, act_dir, out_dir):
 
     print(f"  Collected {n_present_target} data-present trajectories.")
 
-    # --- Save ---
-    out_path = out_dir / "all_trajectories.json"
+    out_path = out_dir / "exoplanet_trajectories.json"
     with open(out_path, "w") as f:
         json.dump(all_trajectories, f, indent=2)
 
@@ -452,7 +370,6 @@ def run_full(model, tokenizer, perturbations, real_materials, act_dir, out_dir):
     print(f"Total: {len(all_trajectories)} trajectories in {total_time:.0f}s")
     print(f"Saved to {out_path}")
 
-    # Quick stats
     for sp_key in sp_keys:
         subset = [t for t in all_trajectories
                   if t["side"] == "empty" and t["system_prompt_variant"] == sp_key]
@@ -474,12 +391,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke-test", action="store_true",
                         help="Run 5-trajectory diagnostic instead of full run")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Cap perturbations and real planets at this many each "
+                             "(yields N × n_prompts trajectories per side). "
+                             "Default uses all in data/exoplanets.json.")
     args = parser.parse_args()
 
-    print("Stage 2: Trajectory Collection + Activation Extraction")
+    print("Stage 2 (Exoplanet): Trajectory Collection + Activation Extraction")
     print("=" * 60)
 
-    # Detect device
     if torch.cuda.is_available():
         device = "cuda"
         print(f"  GPU: {torch.cuda.get_device_name()}")
@@ -494,54 +414,50 @@ def main():
         device = "cpu"
         print("  WARNING: No GPU detected, running on CPU (very slow)")
 
-    # Load model
     print(f"\nLoading {MODEL_NAME} (revision {MODEL_REVISION[:12]}...)...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, revision=MODEL_REVISION)
     if device == "cuda":
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            revision=MODEL_REVISION,
-            torch_dtype=PRECISION,
-            device_map="auto",
+            MODEL_NAME, revision=MODEL_REVISION,
+            torch_dtype=PRECISION, device_map="auto",
         )
     else:
-        # MPS / CPU: load to CPU first, then move (avoids large single alloc)
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            revision=MODEL_REVISION,
-            torch_dtype=PRECISION,
-            low_cpu_mem_usage=True,
+            MODEL_NAME, revision=MODEL_REVISION,
+            torch_dtype=PRECISION, low_cpu_mem_usage=True,
         )
         if device == "mps":
             model = model.to("mps")
     model.eval()
 
     n_params = sum(p.numel() for p in model.parameters())
-    n_layers = model.config.num_hidden_layers  # 32 transformer layers
-    hidden_dim = model.config.hidden_size       # 4096
+    n_layers = model.config.num_hidden_layers
+    hidden_dim = model.config.hidden_size
     print(f"  Loaded: {n_params/1e9:.1f}B params, {n_layers} layers, "
           f"hidden_dim={hidden_dim}")
-    print(f"  output_hidden_states will produce {n_layers + 1} tensors "
-          f"(embedding + {n_layers} layers)")
 
-    # Load data
-    with open(ROOT / "data" / "perturbations_verified.json") as f:
-        perturbations = json.load(f)
-    with open(ROOT / "data" / "materials.json") as f:
+    with open(ROOT / "data" / "exoplanets.json") as f:
         data = json.load(f)
-    real_materials = data["real_materials"]
-    print(f"  {len(perturbations)} perturbations, {len(real_materials)} real materials")
+    real_planets = data["real_planets"]
+    perturbations = data["perturbations"]
+    print(f"  {len(perturbations)} perturbations, {len(real_planets)} real planets")
 
-    # Output dirs
+    if args.limit is not None and not args.smoke_test:
+        perturbations = perturbations[:args.limit]
+        real_planets = real_planets[:args.limit]
+        n_total = args.limit * len(SYSTEM_PROMPTS) * 2
+        print(f"  --limit {args.limit}: capped to {len(perturbations)} perturbations "
+              f"+ {len(real_planets)} real planets ({n_total} total trajectories)")
+
     out_dir = ROOT / "data" / "trajectories"
     act_dir = out_dir / "activations"
     out_dir.mkdir(parents=True, exist_ok=True)
     act_dir.mkdir(parents=True, exist_ok=True)
 
     if args.smoke_test:
-        run_smoke_test(model, tokenizer, perturbations, real_materials, act_dir)
+        run_smoke_test(model, tokenizer, perturbations, real_planets, act_dir)
     else:
-        run_full(model, tokenizer, perturbations, real_materials, act_dir, out_dir)
+        run_full(model, tokenizer, perturbations, real_planets, act_dir, out_dir)
 
 
 if __name__ == "__main__":
