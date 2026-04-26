@@ -391,6 +391,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke-test", action="store_true",
                         help="Run 5-trajectory diagnostic instead of full run")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Cap perturbations and real planets at this many each "
+                             "(yields N × n_prompts trajectories per side). "
+                             "Default uses all in data/exoplanets.json.")
     args = parser.parse_args()
 
     print("Stage 2 (Exoplanet): Trajectory Collection + Activation Extraction")
@@ -437,6 +441,13 @@ def main():
     real_planets = data["real_planets"]
     perturbations = data["perturbations"]
     print(f"  {len(perturbations)} perturbations, {len(real_planets)} real planets")
+
+    if args.limit is not None and not args.smoke_test:
+        perturbations = perturbations[:args.limit]
+        real_planets = real_planets[:args.limit]
+        n_total = args.limit * len(SYSTEM_PROMPTS) * 2
+        print(f"  --limit {args.limit}: capped to {len(perturbations)} perturbations "
+              f"+ {len(real_planets)} real planets ({n_total} total trajectories)")
 
     out_dir = ROOT / "data" / "trajectories"
     act_dir = out_dir / "activations"
